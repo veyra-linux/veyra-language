@@ -1,0 +1,15 @@
+# VEYRA 1.0 arrays: literals, indexing, mutation and list helpers.
+let numbers = [10, 20, 30];
+print "First: " + numbers[0];
+
+numbers[1] = 25;
+list.push(numbers, 40);
+print "After mutation: " + numbers;
+print "Length: " + list.len(numbers);
+print "Last: " + list.get(numbers, list.len(numbers) - 1);
+print "Popped: " + list.pop(numbers);
+print "After pop: " + numbers;
+
+let matrix = [[1, 2], [3, 4]];
+matrix[1][0] = 9;
+print "Nested: " + matrix;
