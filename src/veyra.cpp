@@ -41,13 +41,17 @@ constexpr std::uint64_t MAX_EXECUTION_STEPS = 5'000'000;
 constexpr std::uint64_t MAX_EVALUATION_STEPS = 20'000'000;
 constexpr std::uintmax_t MAX_HASH_BYTES = 256ULL * 1024ULL * 1024ULL;
 constexpr std::size_t MAX_CALL_DEPTH = 256;
+constexpr std::size_t MAX_ARRAY_ITEMS = 100'000;
+constexpr char VEYRA_VERSION[] = "1.0.0";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+struct Array;
+
 struct Value {
-    using Data = std::variant<std::monostate, double, std::string, bool>;
+    using Data = std::variant<std::monostate, double, std::string, bool, std::shared_ptr<Array>>;
     Data data;
 
     Value() : data(std::monostate{}) {}
@@ -56,37 +60,62 @@ struct Value {
     Value(std::string v) : data(std::move(v)) {}
     Value(const char* v) : data(std::string(v)) {}
     Value(bool v) : data(v) {}
+    Value(std::shared_ptr<Array> v) : data(std::move(v)) {}
 
     std::string type_name() const {
         if (std::holds_alternative<double>(data)) return "number";
         if (std::holds_alternative<std::string>(data)) return "string";
         if (std::holds_alternative<bool>(data)) return "bool";
+        if (std::holds_alternative<std::shared_ptr<Array>>(data)) return "array";
         return "none";
     }
-    std::string str() const {
-        if (std::holds_alternative<std::monostate>(data)) return "none";
-        if (auto p = std::get_if<double>(&data)) {
-            std::ostringstream out;
-            if (std::isfinite(*p) && std::floor(*p) == *p && std::fabs(*p) < 9e15)
-                out << std::fixed << std::setprecision(0) << *p;
-            else out << *p;
-            return out.str();
-        }
-        if (auto p = std::get_if<std::string>(&data)) return *p;
-        return std::get<bool>(data) ? "true" : "false";
-    }
-    bool truthy() const {
-        if (std::holds_alternative<std::monostate>(data)) return false;
-        if (auto p = std::get_if<bool>(&data)) return *p;
-        if (auto p = std::get_if<double>(&data)) return *p != 0.0;
-        if (auto p = std::get_if<std::string>(&data)) return !p->empty();
-        return false;
-    }
+    std::string str() const;
+    bool truthy() const;
     double number() const {
         if (auto p = std::get_if<double>(&data)) return *p;
         throw Error("ожидалось число, получено " + type_name());
     }
 };
+
+struct Array { std::vector<Value> items; };
+
+static std::string format_value(const Value& value, std::unordered_set<const Array*>& active, std::size_t depth) {
+    if (std::holds_alternative<std::monostate>(value.data)) return "none";
+    if (auto p = std::get_if<double>(&value.data)) {
+        std::ostringstream out;
+        if (std::isfinite(*p) && std::floor(*p) == *p && std::fabs(*p) < 9e15)
+            out << std::fixed << std::setprecision(0) << *p;
+        else out << *p;
+        return out.str();
+    }
+    if (auto p = std::get_if<std::string>(&value.data)) return *p;
+    if (auto p = std::get_if<bool>(&value.data)) return *p ? "true" : "false";
+    const auto& array = std::get<std::shared_ptr<Array>>(value.data);
+    if (!array) return "[]";
+    if (depth >= 64 || active.contains(array.get())) return "[<cycle>]";
+    active.insert(array.get());
+    std::string out = "[";
+    for (std::size_t i = 0; i < array->items.size(); ++i) {
+        if (i) out += ", ";
+        out += format_value(array->items[i], active, depth + 1);
+        if (out.size() > MAX_STRING_BYTES) { out.resize(MAX_STRING_BYTES); out += "..."; break; }
+    }
+    out += "]";
+    active.erase(array.get());
+    return out;
+}
+std::string Value::str() const {
+    std::unordered_set<const Array*> active;
+    return format_value(*this, active, 0);
+}
+bool Value::truthy() const {
+    if (std::holds_alternative<std::monostate>(data)) return false;
+    if (auto p = std::get_if<bool>(&data)) return *p;
+    if (auto p = std::get_if<double>(&data)) return *p != 0.0;
+    if (auto p = std::get_if<std::string>(&data)) return !p->empty();
+    const auto& p = std::get<std::shared_ptr<Array>>(data);
+    return p && !p->items.empty();
+}
 
 enum class TokenKind { End, Identifier, Number, String, Symbol };
 struct Token {
@@ -130,7 +159,7 @@ public:
                 if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||") {
                     advance(); advance();
                     tokens.push_back({TokenKind::Symbol, two, start_line, start_col});
-                } else if (std::string("{}(),;.+-*/%!<>=").find(c) != std::string::npos) {
+                } else if (std::string("{}[](),;.+-*/%!<>=").find(c) != std::string::npos) {
                     tokens.push_back({TokenKind::Symbol, std::string(1, advance()), start_line, start_col});
                 } else {
                     throw Error(where(start_line, start_col) + "неизвестный символ: '" + std::string(1, c) + "'");
@@ -197,17 +226,18 @@ using ExprPtr = std::shared_ptr<Expr>;
 using StmtPtr = std::shared_ptr<Stmt>;
 
 struct Expr {
-    enum class Kind { Literal, Variable, Unary, Binary, Call } kind;
+    enum class Kind { Literal, Variable, Unary, Binary, Call, ArrayLiteral, Index } kind;
     Value literal;
     std::string text;
     ExprPtr left, right;
     std::vector<ExprPtr> args;
 };
 struct Stmt {
-    enum class Kind { Let, Const, Assign, Print, If, While, For, Break, Continue, Function, Return, Expression } kind;
+    enum class Kind { Let, Const, Assign, IndexAssign, Print, If, While, For, Break, Continue, Function, Return, Expression } kind;
     std::string name;
     std::vector<std::string> params;
     ExprPtr expr;
+    ExprPtr target;
     StmtPtr initializer, increment;
     std::vector<StmtPtr> body, else_body;
 };
@@ -319,17 +349,35 @@ private:
             if (!check(";") && !check("}") && peek().kind != TokenKind::End) s->expr=expression();
             optional_semicolon(); return s;
         }
-        if (peek().kind == TokenKind::Identifier && current_ + 1 < tokens_.size() && tokens_[current_+1].text == "=") {
-            auto s=std::make_shared<Stmt>(); s->kind=Stmt::Kind::Assign; s->name=advance().text; advance(); s->expr=expression(); optional_semicolon(); return s;
+        return assignment_or_expression(true);
+    }
+    StmtPtr assignment_or_expression(bool semicolon) {
+        ExprPtr lhs = expression();
+        if (match("=")) {
+            const Token& assignment_token = previous();
+            ExprPtr rhs = expression();
+            auto s = std::make_shared<Stmt>();
+            s->expr = std::move(rhs);
+            if (lhs->kind == Expr::Kind::Variable) {
+                s->kind = Stmt::Kind::Assign;
+                s->name = lhs->text;
+            } else if (lhs->kind == Expr::Kind::Index) {
+                s->kind = Stmt::Kind::IndexAssign;
+                s->target = std::move(lhs);
+            } else {
+                fail(assignment_token, "слева от '=' должна быть переменная или элемент массива");
+            }
+            if (semicolon) optional_semicolon();
+            return s;
         }
-        auto s=std::make_shared<Stmt>(); s->kind=Stmt::Kind::Expression; s->expr=expression(); optional_semicolon(); return s;
+        auto s = std::make_shared<Stmt>();
+        s->kind = Stmt::Kind::Expression;
+        s->expr = std::move(lhs);
+        if (semicolon) optional_semicolon();
+        return s;
     }
     StmtPtr for_clause_statement() {
-        if (peek().kind == TokenKind::Identifier && current_ + 1 < tokens_.size() && tokens_[current_+1].text == "=") {
-            auto s=std::make_shared<Stmt>(); s->kind=Stmt::Kind::Assign;
-            s->name=advance().text; advance(); s->expr=expression(); return s;
-        }
-        auto s=std::make_shared<Stmt>(); s->kind=Stmt::Kind::Expression; s->expr=expression(); return s;
+        return assignment_or_expression(false);
     }
     std::vector<StmtPtr> block() {
         NestingGuard guard(nesting_);
@@ -362,27 +410,47 @@ private:
         if (check("!") || check("-")) { auto op=advance().text; return node(Expr::Kind::Unary, op, unary()); }
         return primary();
     }
+    ExprPtr postfix(ExprPtr e) {
+        while (match("[")) {
+            ExprPtr index = expression();
+            consume("]", "ожидается ']' после индекса");
+            e = node(Expr::Kind::Index, "[]", std::move(e), std::move(index));
+        }
+        return e;
+    }
     ExprPtr primary() {
         NestingGuard guard(nesting_);
-        if (match("true")) return literal(Value(true));
-        if (match("false")) return literal(Value(false));
-        if (match("none")) return literal(Value());
-        if (peek().kind == TokenKind::Number) {
-            auto t=advance(); try { const double n=std::stod(t.text); if(!std::isfinite(n)) fail(t,"число вне допустимого диапазона"); return literal(Value(n)); } catch (const Error&) { throw; } catch (...) { fail(t, "неверное число"); }
-        }
-        if (peek().kind == TokenKind::String) return literal(Value(advance().text));
-        if (match("(")) { auto e=expression(); consume(")", "ожидается ')'"); return e; }
-        if (peek().kind == TokenKind::Identifier) {
+        ExprPtr e;
+        if (match("true")) e = literal(Value(true));
+        else if (match("false")) e = literal(Value(false));
+        else if (match("none")) e = literal(Value());
+        else if (peek().kind == TokenKind::Number) {
+            auto t=advance();
+            try { const double n=std::stod(t.text); if(!std::isfinite(n)) fail(t,"число вне допустимого диапазона"); e=literal(Value(n)); }
+            catch (const Error&) { throw; } catch (...) { fail(t, "неверное число"); }
+        } else if (peek().kind == TokenKind::String) e = literal(Value(advance().text));
+        else if (match("(")) { e=expression(); consume(")", "ожидается ')'"); }
+        else if (match("[")) {
+            e = node(Expr::Kind::ArrayLiteral, "[]");
+            if (!check("]")) {
+                do {
+                    if (e->args.size() >= MAX_ARRAY_ITEMS) fail(peek(), "массив превышает лимит 100 000 элементов");
+                    e->args.push_back(expression());
+                } while (match(",") && !check("]"));
+            }
+            consume("]", "ожидается ']' после элементов массива");
+        } else if (peek().kind == TokenKind::Identifier) {
             std::string name=advance().text;
             while (match(".")) name += "." + consume_identifier("после '.' ожидается имя").text;
             if (match("(")) {
-                auto e=node(Expr::Kind::Call, name);
+                e=node(Expr::Kind::Call, name);
                 if (!check(")")) do { e->args.push_back(expression()); } while (match(","));
-                consume(")", "ожидается ')' после аргументов"); return e;
-            }
-            return node(Expr::Kind::Variable, name);
+                consume(")", "ожидается ')' после аргументов");
+            } else e = node(Expr::Kind::Variable, name);
+        } else {
+            fail(peek(), "ожидалось выражение, найдено '" + peek().text + "'");
         }
-        fail(peek(), "ожидалось выражение, найдено '" + peek().text + "'");
+        return postfix(std::move(e));
     }
 };
 
@@ -433,12 +501,28 @@ private:
         if (!std::isfinite(n)) throw Error(operation + ": результат вне допустимого диапазона числа");
         return Value(n);
     }
+    static bool references_array(const Value& value, const Array* target, std::unordered_set<const Array*>& visited) {
+        auto ptr = std::get_if<std::shared_ptr<Array>>(&value.data);
+        if (!ptr || !*ptr) return false;
+        if (ptr->get() == target) return true;
+        if (!visited.insert(ptr->get()).second) return false;
+        for (const auto& item : (*ptr)->items)
+            if (references_array(item, target, visited)) return true;
+        return false;
+    }
+    static void reject_array_cycle(const std::shared_ptr<Array>& target, const Value& value, const std::string& operation) {
+        std::unordered_set<const Array*> visited;
+        if (references_array(value, target.get(), visited))
+            throw Error(operation + ": cyclic arrays are not allowed");
+    }
+
     static bool same_value(const Value& a, const Value& b) {
         if (a.data.index()!=b.data.index()) return false;
         if (std::holds_alternative<std::monostate>(a.data)) return true;
         if (auto p=std::get_if<double>(&a.data)) return *p==std::get<double>(b.data);
         if (auto p=std::get_if<std::string>(&a.data)) return *p==std::get<std::string>(b.data);
-        return std::get<bool>(a.data)==std::get<bool>(b.data);
+        if (auto p=std::get_if<bool>(&a.data)) return *p==std::get<bool>(b.data);
+        return std::get<std::shared_ptr<Array>>(a.data)==std::get<std::shared_ptr<Array>>(b.data);
     }
     static std::string arg_string(const std::vector<Value>& a, std::size_t i, const std::string& fn) {
         if (i>=a.size()) throw Error(fn + ": не хватает аргументов");
@@ -488,6 +572,45 @@ private:
             else result=std::pow(a,b);
             if (!std::isfinite(result)) throw Error(name + ": результат вне допустимого диапазона");
             return Value(result);
+        }
+        if (name.rfind("list.", 0) == 0) {
+            auto require_array = [&](std::size_t i) -> std::shared_ptr<Array> {
+                if (i >= args.size()) throw Error(name + ": не хватает аргументов");
+                auto p = std::get_if<std::shared_ptr<Array>>(&args[i].data);
+                if (!p || !*p) throw Error(name + ": аргумент " + std::to_string(i + 1) + " должен быть массивом");
+                return *p;
+            };
+            auto checked_index = [&](const Value& value, const std::string& fn) -> std::size_t {
+                double n = value.number();
+                if (!std::isfinite(n) || n < 0 || std::floor(n) != n || n > static_cast<double>(MAX_ARRAY_ITEMS))
+                    throw Error(fn + ": индекс должен быть целым неотрицательным числом");
+                return static_cast<std::size_t>(n);
+            };
+            if (name == "list.len") { arity(args,1,name); return Value(static_cast<double>(require_array(0)->items.size())); }
+            if (name == "list.push") {
+                arity(args,2,name); auto a = require_array(0);
+                if (a->items.size() >= MAX_ARRAY_ITEMS) throw Error(name + ": превышен лимит 100 000 элементов");
+                reject_array_cycle(a, args[1], name);
+                a->items.push_back(args[1]); return Value(static_cast<double>(a->items.size()));
+            }
+            if (name == "list.pop") {
+                arity(args,1,name); auto a = require_array(0);
+                if (a->items.empty()) throw Error(name + ": нельзя извлечь элемент из пустого массива");
+                Value result = a->items.back(); a->items.pop_back(); return result;
+            }
+            if (name == "list.get") {
+                arity(args,2,name); auto a = require_array(0); auto i = checked_index(args[1], name);
+                if (i >= a->items.size()) throw Error(name + ": индекс вне границ массива");
+                return a->items[i];
+            }
+            if (name == "list.set") {
+                arity(args,3,name); auto a = require_array(0); auto i = checked_index(args[1], name);
+                if (i >= a->items.size()) throw Error(name + ": индекс вне границ массива");
+                reject_array_cycle(a, args[2], name);
+                a->items[i] = args[2]; return args[2];
+            }
+            if (name == "list.clear") { arity(args,1,name); require_array(0)->items.clear(); return Value(); }
+            throw Error("неизвестная функция '" + name + "'");
         }
         if (name=="linux.os") { arity(args,0,name); return Value("Linux"); }
         if (name=="linux.kernel" || name=="linux.arch" || name=="linux.hostname") {
@@ -583,6 +706,24 @@ private:
         switch(e->kind) {
             case Expr::Kind::Literal: return e->literal;
             case Expr::Kind::Variable: return env->get(e->text);
+            case Expr::Kind::ArrayLiteral: {
+                auto array = std::make_shared<Array>();
+                array->items.reserve(e->args.size());
+                for (const auto& item : e->args) array->items.push_back(eval(item, env));
+                return Value(array);
+            }
+            case Expr::Kind::Index: {
+                Value base = eval(e->left, env);
+                Value raw_index = eval(e->right, env);
+                double n = raw_index.number();
+                if (!std::isfinite(n) || n < 0 || std::floor(n) != n || n > static_cast<double>(MAX_ARRAY_ITEMS))
+                    throw Error("индекс массива должен быть целым неотрицательным числом");
+                auto array = std::get_if<std::shared_ptr<Array>>(&base.data);
+                if (!array || !*array) throw Error("индексация поддерживается только для массивов");
+                const auto index = static_cast<std::size_t>(n);
+                if (index >= (*array)->items.size()) throw Error("индекс вне границ массива");
+                return (*array)->items[index];
+            }
             case Expr::Kind::Unary: {
                 Value v=eval(e->left,env);
                 if (e->text=="!") return Value(!v.truthy());
@@ -624,7 +765,8 @@ private:
             case Expr::Kind::Call: {
                 std::vector<Value> args; args.reserve(e->args.size()); for (auto& a:e->args) args.push_back(eval(a,env));
                 if (e->text.rfind("linux.",0)==0 || e->text.rfind("security.",0)==0 ||
-                    e->text.rfind("text.",0)==0 || e->text.rfind("math.",0)==0 || e->text=="system.cwd")
+                    e->text.rfind("text.",0)==0 || e->text.rfind("math.",0)==0 ||
+                    e->text.rfind("list.",0)==0 || e->text=="system.cwd")
                     return call_builtin(e->text,args);
                 auto it=functions_.find(e->text); if (it==functions_.end()) throw Error("неизвестная функция '"+e->text+"'");
                 if (args.size()!=it->second.params.size()) throw Error("функция '"+e->text+"': ожидалось аргументов " + std::to_string(it->second.params.size()) + ", получено " + std::to_string(args.size()));
@@ -651,6 +793,22 @@ private:
             case Stmt::Kind::Let: env->define(s->name,eval(s->expr,env)); break;
             case Stmt::Kind::Const: env->define(s->name,eval(s->expr,env),true); break;
             case Stmt::Kind::Assign: env->assign(s->name,eval(s->expr,env)); break;
+            case Stmt::Kind::IndexAssign: {
+                if (!s->target || s->target->kind != Expr::Kind::Index) throw Error("внутренняя ошибка: неверная цель присваивания");
+                Value base = eval(s->target->left, env);
+                Value raw_index = eval(s->target->right, env);
+                double n = raw_index.number();
+                if (!std::isfinite(n) || n < 0 || std::floor(n) != n || n > static_cast<double>(MAX_ARRAY_ITEMS))
+                    throw Error("индекс массива должен быть целым неотрицательным числом");
+                auto array = std::get_if<std::shared_ptr<Array>>(&base.data);
+                if (!array || !*array) throw Error("изменять по индексу можно только массив");
+                const auto index = static_cast<std::size_t>(n);
+                if (index >= (*array)->items.size()) throw Error("индекс вне границ массива");
+                Value value = eval(s->expr, env);
+                reject_array_cycle(*array, value, "присваивание элементу массива");
+                (*array)->items[index] = std::move(value);
+                break;
+            }
             case Stmt::Kind::Print: {
                 const std::string output=eval(s->expr,env).str();
                 if (output.size()>=MAX_OUTPUT_BYTES || output_bytes_>MAX_OUTPUT_BYTES-output.size()-1)
@@ -700,7 +858,7 @@ private:
 };
 
 void usage() {
-    std::cout << "VEYRA language 0.2.0 — Linux-only runtime\n"
+    std::cout << "VEYRA language " << VEYRA_VERSION << " — Linux-only runtime\n"
               << "Usage: veyra <file.vey>       Run program\n"
               << "       veyra --check <file.vey> Validate syntax without running\n"
               << "       veyra --builtins         List standard functions\n"
@@ -709,6 +867,7 @@ void usage() {
               << "Limits: source 4 MiB, tokens 250k, parser depth 256, loops 1M,\n"
               << "        execution 5M statements, evaluation 20M operations,\n"
               << "        output 16 MiB, string 4 MiB.\n"
+              << "Arrays: literals, indexing, assignment, list.len/push/pop/get/set/clear.\n"
               << "Safety: no shell execution, network API, or arbitrary file-write builtin.\n";
 }
 
@@ -718,10 +877,11 @@ int main(int argc, char** argv) {
     using namespace veyra;
     if (argc==1) { usage(); return 0; }
     if (argc==2 && (std::string(argv[1])=="--help" || std::string(argv[1])=="-h")) { usage(); return 0; }
-    if (argc==2 && (std::string(argv[1])=="--version" || std::string(argv[1])=="-v")) { std::cout << "VEYRA 0.2.0 (Linux-only, C++20)\n"; return 0; }
+    if (argc==2 && (std::string(argv[1])=="--version" || std::string(argv[1])=="-v")) { std::cout << "VEYRA " << VEYRA_VERSION << " (Linux-only, C++20)\n"; return 0; }
     if (argc==2 && std::string(argv[1])=="--builtins") {
         std::cout << "text.len, text.lower, text.upper, text.trim, text.contains, text.starts_with, text.ends_with\n"
                   << "math.abs, math.floor, math.ceil, math.round, math.sqrt, math.min, math.max, math.pow\n"
+                  << "list.len, list.push, list.pop, list.get, list.set, list.clear\n"
                   << "linux.os, linux.kernel, linux.arch, linux.hostname, linux.pid, linux.page_size, system.cwd\n"
                   << "security.is_root, security.uid, security.exists, security.readable, security.writable, security.executable\n"
                   << "security.mode, security.audit, security.sha256, security.is_file, security.is_directory, security.is_symlink\n"
