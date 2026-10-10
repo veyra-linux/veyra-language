@@ -1,0 +1,5 @@
+# Первый пример на VEYRA
+print "Привет! Это язык VEYRA.";
+print "Запущено в: " + linux.os();
+print "Ядро: " + linux.kernel();
+print "Архитектура: " + linux.arch();

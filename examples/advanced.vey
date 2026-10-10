@@ -1,0 +1,27 @@
+# VEYRA 0.2.0: неизменяемые значения, for, break/continue, текст и математика
+const limit = 8;
+let total = 0;
+
+for (let i = 0; i < limit; i = i + 1) {
+    if (i == 2) {
+        continue;
+    }
+    if (i == 6) {
+        break;
+    }
+    total = total + i;
+}
+
+fn describe(value) {
+    return text.upper(text.trim(value));
+}
+
+print "Сумма = " + total;
+print describe("  veyra linux  ");
+print "Корень 81 = " + math.sqrt(81);
+print "Ядро Linux: " + linux.kernel();
+print "PID: " + linux.pid();
+print "Текущий каталог: " + system.cwd();
+print "Обычный файл /etc/passwd: " + security.is_file("/etc/passwd");
+print "Символическая ссылка /etc/passwd: " + security.is_symlink("/etc/passwd");
+print "Есть world-write у /etc/passwd: " + security.world_writable("/etc/passwd");

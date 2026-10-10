@@ -1,0 +1,16 @@
+# Безопасный read-only аудит выбранных системных файлов.
+# Скрипт ничего не изменяет и не запускает системные команды.
+print "=== VEYRA: Linux security check ===";
+print "Kernel: " + linux.kernel();
+print "Architecture: " + linux.arch();
+print "Effective root: " + security.is_root();
+print "\n--- /etc/passwd ---";
+print security.audit("/etc/passwd");
+print "\n--- /etc/shadow ---";
+if (security.exists("/etc/shadow")) {
+    print security.audit("/etc/shadow");
+} else {
+    print "Файл /etc/shadow отсутствует.";
+}
+print "\nSHA-256 /etc/passwd:";
+print security.sha256("/etc/passwd");

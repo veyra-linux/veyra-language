@@ -1,0 +1,22 @@
+# Переменные, условия, циклы и функции
+let name = "Abduali";
+let version = 1;
+print "Привет, " + name + "!";
+
+fn square(n) {
+    return n * n;
+}
+
+print "Квадрат 7 = " + square(7);
+
+let count = 3;
+while (count > 0) {
+    print "До старта: " + count;
+    count = count - 1;
+}
+
+if (security.is_root()) {
+    print "Внимание: VEYRA запущена с правами root.";
+} else {
+    print "Хорошо: программа запущена без root.";
+}
